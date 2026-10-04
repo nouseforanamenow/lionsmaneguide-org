@@ -48,18 +48,20 @@ jobs:
           post = pathlib.Path("blog") / slug / "index.html"
           html = post.read_text(errors="ignore")
 
+          def strip(x):
+              return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", x)).strip()
+
           def first(*patterns, default=""):
               for p in patterns:
                   m = re.search(p, html, re.S | re.I)
                   if m:
-                      return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
+                      return strip(m.group(1))
               return default
 
-          title = first(r"<h1[^>]*>(.*?)</h1>", r"<title>(.*?)</title>", default=slug)
-          title = re.split(r"\s*\|\s*", title)[0].strip()
+          title = re.split(r"\s*\|\s*", first(r"<h1[^>]*>(.*?)</h1>", r"<title>(.*?)</title>",
+                                              default=slug))[0].strip()
           dek = first(r'<meta name="description" content="(.*?)"')
-          iso = first(r'"datePublished":\s*"(\d{4}-\d{2}-\d{2})',
-                      default=today.isoformat())[:10]
+          iso = first(r'"datePublished":\s*"(\d{4}-\d{2}-\d{2})', default=today.isoformat())[:10]
           try:
               shown = datetime.date.fromisoformat(iso).strftime("%B %Y")
           except ValueError:
@@ -67,20 +69,39 @@ jobs:
 
           idx = pathlib.Path("blog/index.html")
           page = idx.read_text()
+
           if f'href="/blog/{slug}/"' not in page:
-              card = (f'    <a class="post-card" href="/blog/{slug}/">\n'
-                      f'      <span class="pc-date">{shown}</span>\n'
-                      f'      <h2 class="pc-title">{title}</h2>\n'
-                      f'      <p class="pc-dek">{dek}</p>\n'
-                      f'      <span class="pc-read">Read the guide &rarr;</span>\n'
-                      f'    </a>\n')
-              anchor = page.find('<a class="post-card"')
-              if anchor == -1:
-                  raise SystemExit("blog index has no post-card list to extend")
-              # newest first, so the card goes above the existing ones
-              page = page[:anchor - 4] + card + page[anchor - 4:]
+              # Clone an existing card instead of hardcoding markup: every site in this
+              # network has its own theme and its own card classes, so the only safe
+              # template is the one already on the page.
+              cards = [m for m in re.finditer(
+                  r'<a\b[^>]*href="/blog/(?!"|\s)([^"]+)/"[^>]*>.*?</a>', page, re.S | re.I)]
+              cards = [m for m in cards if m.group(1).strip()]
+              if not cards:
+                  raise SystemExit("blog index has no existing post card to copy")
+              tpl, old_slug = cards[0].group(0), cards[0].group(1)
+
+              card = tpl.replace(f'/blog/{old_slug}/', f'/blog/{slug}/')
+
+              def set_text(block, pattern, value, count=1):
+                  return re.sub(pattern, lambda m: m.group(1) + value + m.group(3), block,
+                                count=count, flags=re.S | re.I)
+
+              card = set_text(card, r"(<(?:h2|h3)\b[^>]*>)(.*?)(</(?:h2|h3)>)", title)
+              if dek:
+                  card = set_text(card, r"(<p\b[^>]*>)(.*?)(</p>)", dek)
+              # whatever text node currently holds a "July 2026" style date, wherever it
+              # sits: some themes print it alone, others inline with a read time
+              card = re.sub(r"(>[^<]*?)((?:January|February|March|April|May|June|July|August|"
+                            r"September|October|November|December) \d{4})",
+                            lambda m: m.group(1) + shown, card, count=1)
+
+              start = cards[0].start()
+              line_start = page.rfind("\n", 0, start) + 1
+              indent = page[line_start:start]
+              page = page[:line_start] + indent + card + "\n" + page[line_start:]
               idx.write_text(page)
-              print("blog index: card added")
+              print(f"blog index: card added (cloned from {old_slug})")
 
           sm = pathlib.Path("sitemap.xml")
           s = sm.read_text()
@@ -90,9 +111,7 @@ jobs:
                             f"  <url>\n    <loc>{loc}</loc>\n"
                             f"    <lastmod>{iso}</lastmod>\n"
                             "    <priority>0.7</priority>\n  </url>\n</urlset>")
-          # the blog index genuinely changed, so its lastmod moves with it
-          s = re.sub(r"(<loc>https://" + re.escape(domain) +
-                     r"/blog/</loc>\s*<lastmod>)[0-9-]{10}",
+          s = re.sub(r"(<loc>https://" + re.escape(domain) + r"/blog/</loc>\s*<lastmod>)[0-9-]{10}",
                      lambda m: m.group(1) + today.isoformat(), s)
           sm.write_text(s)
           print("sitemap: entry added, blog index lastmod bumped")
