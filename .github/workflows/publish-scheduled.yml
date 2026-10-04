@@ -1,0 +1,112 @@
+name: Publish Scheduled Post
+
+on:
+  schedule:
+    - cron: '0 15 * * 4'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Promotes the oldest folder in blog/scheduled/ into blog/, then makes the blog
+# index and the sitemap agree with it. Pushing is the deploy: this repo is the
+# Git source of the Vercel project, so a commit here ships to lionsmaneguide.org.
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Promote the oldest queued post
+        id: drain
+        run: |
+          # Alphabetical, not mtime: a fresh checkout gives every file the same
+          # mtime, so sorting by time picks an arbitrary post.
+          DIR=$(find blog/scheduled -mindepth 1 -maxdepth 1 -type d | sort | head -1)
+          if [ -z "$DIR" ]; then
+            echo "queue is empty, nothing to publish"
+            echo "slug=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          SLUG=$(basename "$DIR")
+          git mv "$DIR" "blog/$SLUG"
+          echo "slug=$SLUG" >> $GITHUB_OUTPUT
+          echo "published blog/$SLUG/"
+
+      - name: Add it to the blog index and the sitemap
+        if: steps.drain.outputs.slug != ''
+        env:
+          SLUG: ${{ steps.drain.outputs.slug }}
+          DOMAIN: lionsmaneguide.org
+        run: |
+          python3 - <<'PY'
+          import os, re, datetime, pathlib
+
+          slug = os.environ["SLUG"]
+          domain = os.environ["DOMAIN"]
+          today = datetime.date.today()
+          post = pathlib.Path("blog") / slug / "index.html"
+          html = post.read_text(errors="ignore")
+
+          def first(*patterns, default=""):
+              for p in patterns:
+                  m = re.search(p, html, re.S | re.I)
+                  if m:
+                      return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
+              return default
+
+          title = first(r"<h1[^>]*>(.*?)</h1>", r"<title>(.*?)</title>", default=slug)
+          title = re.split(r"\s*\|\s*", title)[0].strip()
+          dek = first(r'<meta name="description" content="(.*?)"')
+          iso = first(r'"datePublished":\s*"(\d{4}-\d{2}-\d{2})',
+                      default=today.isoformat())[:10]
+          try:
+              shown = datetime.date.fromisoformat(iso).strftime("%B %Y")
+          except ValueError:
+              iso, shown = today.isoformat(), today.strftime("%B %Y")
+
+          idx = pathlib.Path("blog/index.html")
+          page = idx.read_text()
+          if f'href="/blog/{slug}/"' not in page:
+              card = (f'    <a class="post-card" href="/blog/{slug}/">\n'
+                      f'      <span class="pc-date">{shown}</span>\n'
+                      f'      <h2 class="pc-title">{title}</h2>\n'
+                      f'      <p class="pc-dek">{dek}</p>\n'
+                      f'      <span class="pc-read">Read the guide &rarr;</span>\n'
+                      f'    </a>\n')
+              anchor = page.find('<a class="post-card"')
+              if anchor == -1:
+                  raise SystemExit("blog index has no post-card list to extend")
+              # newest first, so the card goes above the existing ones
+              page = page[:anchor - 4] + card + page[anchor - 4:]
+              idx.write_text(page)
+              print("blog index: card added")
+
+          sm = pathlib.Path("sitemap.xml")
+          s = sm.read_text()
+          loc = f"https://{domain}/blog/{slug}/"
+          if loc not in s:
+              s = s.replace("</urlset>",
+                            f"  <url>\n    <loc>{loc}</loc>\n"
+                            f"    <lastmod>{iso}</lastmod>\n"
+                            "    <priority>0.7</priority>\n  </url>\n</urlset>")
+          # the blog index genuinely changed, so its lastmod moves with it
+          s = re.sub(r"(<loc>https://" + re.escape(domain) +
+                     r"/blog/</loc>\s*<lastmod>)[0-9-]{10}",
+                     lambda m: m.group(1) + today.isoformat(), s)
+          sm.write_text(s)
+          print("sitemap: entry added, blog index lastmod bumped")
+          PY
+
+      - name: Commit
+        if: steps.drain.outputs.slug != ''
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing changed"
+          else
+            git commit -m "Publish scheduled post: ${{ steps.drain.outputs.slug }}"
+            git push
+          fi
