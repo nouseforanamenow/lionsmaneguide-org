@@ -110,3 +110,17 @@ jobs:
             git commit -m "Publish scheduled post: ${{ steps.drain.outputs.slug }}"
             git push
           fi
+
+      # Two ways this reaches production, and the workflow supports either.
+      # If the repo is connected to the Vercel project through the Vercel
+      # GitHub App, the push above IS the deploy and this step is skipped
+      # because no token is set. Until then, a VERCEL_TOKEN secret lets the
+      # CLI ship the same commit. Connect the app and the secret can be
+      # deleted; nothing else changes.
+      - name: Deploy to Vercel
+        if: steps.drain.outputs.slug != '' && env.VERCEL_TOKEN != ''
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_5Og6Ko6QVyT9wVnPAReuS8cu
+          VERCEL_PROJECT_ID: prj_9yLERm31Hln6eyCSxmVewQ6FUSna
+        run: npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN"
